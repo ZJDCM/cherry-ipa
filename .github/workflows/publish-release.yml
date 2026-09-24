@@ -1,0 +1,32 @@
+name: Publish unsigned IPA release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download IPA artifact from build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          gh run download 35970021961 -R ZJDCM/cherry-ipa -n CherryStudio-unsigned-ipa -D out
+          ls -la out
+      - name: Create GitHub Release with IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          tag="trollstore-ipa-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$tag" \
+            --repo ZJDCM/cherry-ipa \
+            --title "Cherry Studio unsigned IPA ($tag)" \
+            --notes "Unsigned iOS IPA built from CherryHQ/cherry-studio-app for TrollStore sideloading." \
+            out/*.ipa out/SHA256SUMS.txt
+          echo "RELEASE_TAG=$tag"
