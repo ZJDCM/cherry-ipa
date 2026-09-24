@@ -1,0 +1,107 @@
+name: Patch IPA to iOS 16 (TrollStore)
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_tag:
+        description: "源 Release tag（含 17.0 版 IPA）"
+        required: true
+        default: "trollstore-ipa-20260924-082820"
+      min_ios:
+        description: "目标最低系统版本"
+        required: true
+        default: "16.0"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download source IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          gh release download "${{ inputs.src_tag }}" -R ZJDCM/cherry-ipa -p "*.ipa" -D in
+          ls -la in
+      - name: Patch Mach-O minOS and Info.plist
+        env:
+          MIN_IOS: ${{ inputs.min_ios }}
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import os, struct, plistlib, zipfile, shutil
+          minv = os.environ["MIN_IOS"]
+          def enc(v):
+              a,b,c = (list(map(int, v.split(".")))+[0,0])[:3]
+              return (a<<16)|(b<<8)|c
+          target = enc(minv)
+          src = "in/CherryStudio-unsigned.ipa"
+          out = "CherryStudio-unsigned-ios16.ipa"
+          z = zipfile.ZipFile(src)
+          names = z.namelist()
+          work = "work"
+          shutil.rmtree(work, ignore_errors=True)
+          z.extractall(work)
+          def patched_minos(path):
+              d = bytearray(open(path,"rb").read())
+              if d[:4] != b"\xcf\xfa\xed\xfe":
+                  return None
+              n = struct.unpack("<I", d[16:20])[0]; p = 32; old = None
+              for _ in range(n):
+                  cmd, cs = struct.unpack("<II", d[p:p+8])
+                  if cmd == 0x32:
+                      old = struct.unpack("<I", d[p+12:p+16])[0]
+                      if old > target:
+                          d[p+12:p+16] = struct.pack("<I", target)
+                          open(path,"wb").write(d)
+                          return old
+                      return old
+                  p += cs
+              return old
+          for root, _, files in os.walk(work):
+              for fn in files:
+                  fp = os.path.join(root, fn)
+                  if fn == "CherryStudio" or fp.endswith(".dylib") or root.endswith(".appex"):
+                      try:
+                          o = patched_minos(fp)
+                      except Exception:
+                          o = None
+                      if o:
+                          print("minos", hex(o), "->", hex(target), fp)
+          for root, _, files in os.walk(work):
+              for fn in files:
+                  if fn == "Info.plist":
+                      fp = os.path.join(root, fn)
+                      try:
+                          raw = open(fp,"rb").read()
+                          fmt = plistlib.FMT_BINARY if raw[:6]==b"bplist" else plistlib.FMT_XML
+                          d = plistlib.loads(raw)
+                          ch = False
+                          for k in ("MinimumOSVersion","LSMinimumSystemVersion"):
+                              if k in d and str(d[k]).split(".")[0] not in ("","__"):
+                                  try:
+                                      if enc(str(d[k])) > target: d[k] = minv; ch = True
+                                  except Exception: pass
+                          if ch:
+                              open(fp,"wb").write(plistlib.dumps(d, fmt=fmt)); print("plist", fp, "->", minv)
+                      except Exception:
+                          pass
+          shutil.make_archive("pkg", "zip", work)
+          os.replace("pkg.zip", out)
+          print("built", out, os.path.getsize(out))
+          PY
+          sha256sum CherryStudio-unsigned-ios16.ipa | tee SHA256SUMS-ios16.txt
+      - name: Create release with patched IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          tag="trollstore-ipa-ios16-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$tag" -R ZJDCM/cherry-ipa \
+            --title "Cherry Studio unsigned IPA (iOS 16 patched) $tag" \
+            --notes "minOS patched to ${{ inputs.min_ios }} for iOS 16.6.1 TrollStore. Unsigned." \
+            CherryStudio-unsigned-ios16.ipa SHA256SUMS-ios16.txt
+          echo "TAG=$tag"
