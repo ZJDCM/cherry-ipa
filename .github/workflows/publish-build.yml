@@ -1,0 +1,41 @@
+name: Publish build as release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "要发布的 build-ios-ipa run id"
+        required: true
+      tag_suffix:
+        description: "tag 后缀（如 ios164）"
+        required: true
+        default: "ios164"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          set -euxo pipefail
+          gh run download "${{ inputs.run_id }}" -R ZJDCM/cherry-ipa -n CherryStudio-unsigned-ipa -D out || true
+          ls -la out || true
+          if [ ! -f out/CherryStudio-unsigned.ipa ]; then
+            gh api "/repos/ZJDCM/cherry-ipa/actions/runs/${{ inputs.run_id }}/artifacts" > arts.json
+            cat arts.json
+          fi
+      - name: Create release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          set -euxo pipefail
+          tag="trollstore-ipa-${{ inputs.tag_suffix }}-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$tag" -R ZJDCM/cherry-ipa \
+            --title "Cherry Studio IPA (${{ inputs.tag_suffix }}) $tag" \
+            --notes "Built from source with deploymentTarget=${{ inputs.tag_suffix }}." \
+            out/*
+          echo "TAG=$tag"
