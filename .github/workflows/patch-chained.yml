@@ -1,0 +1,127 @@
+name: Patch IPA (minOS16 + weak chained imports)
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_tag:
+        required: true
+        default: "trollstore-ipa-20260924-082820"
+      min_ios:
+        required: true
+        default: "16.0"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download source IPA
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          set -euxo pipefail
+          gh release download "${{ inputs.src_tag }}" -R ZJDCM/cherry-ipa -p "*.ipa" -D in
+          ls -la in
+      - name: Patch (minOS + symtab weak + chained-imports weak) and Info.plist
+        env: { MIN_IOS: "${{ inputs.min_ios }}" }
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import os, struct, plistlib, zipfile, shutil
+          minv=os.environ["MIN_IOS"]
+          def enc(v):
+              a,b,c=(list(map(int,v.split(".")))+[0,0])[:3]; return (a<<16)|(b<<8)|c
+          target=enc(minv)
+
+          def slices(d):
+              if d[:4]==b'\xcf\xfa\xed\xfe': return [0]
+              if d[:4]==b'\xca\xfe\xba\xbe':
+                  n=struct.unpack('>I',d[4:8])[0]; return [struct.unpack('>I',d[8+i*20+8:8+i*20+12])[0] for i in range(n)]
+              if d[:4]==b'\xbe\xba\xfe\xca':
+                  n=struct.unpack('<I',d[4:8])[0]; return [struct.unpack('<I',d[8+i*20+8:8+i*20+12])[0] for i in range(n)]
+              return None
+
+          def patch_macho(path):
+              d=bytearray(open(path,"rb").read()); offs=slices(d)
+              if offs is None: return (0,0)
+              nmin=0; nweak=0
+              for off in offs:
+                  if d[off:off+4]!=b'\xcf\xfa\xed\xfe': continue
+                  ncmds=struct.unpack('<I',d[off+16:off+20])[0]; p=off+32
+                  symtab=None; chain=None
+                  for _ in range(ncmds):
+                      cmd,cs=struct.unpack('<II',d[p:p+8])
+                      if cmd==0x32:
+                          cur=struct.unpack('<I',d[p+12:p+16])[0]
+                          if cur>target: d[p+12:p+16]=struct.pack('<I',target); nmin+=1
+                      if cmd==0x02: symtab=struct.unpack('<IIII',d[p+8:p+24])
+                      if cmd==0x80000034: chain=struct.unpack('<II',d[p+8:p+16])
+                      p+=cs
+                  if symtab:
+                      symoff,nsyms,stroff,strsize=symtab
+                      for i in range(nsyms):
+                          b=off+symoff+i*16
+                          t=d[b+4]
+                          if (t & 0x0e)==0 and (t & 0x01)!=0 and not (t & 0x40):
+                              d[b+4]=t|0x40; nweak+=1
+                  if chain:
+                      foff,fsize=chain
+                      base=off+foff
+                      ver,starts,imports,symbols,count,ifmt,symfmt=struct.unpack('<7I', d[base:base+28])
+                      imp=base+imports
+                      if ifmt==3:
+                          for i in range(count):
+                              w=struct.unpack('<Q', d[imp+i*16:imp+i*16+8])[0]
+                              if not ((w>>16)&1):
+                                  struct.pack_into('<Q', d, imp+i*16, w | (1<<16)); nweak+=1
+                      elif ifmt in (1,2):
+                          step=8 if ifmt==2 else 4
+                          for i in range(count):
+                              w=struct.unpack('<I', d[imp+i*step:imp+i*step+4])[0]
+                              if not ((w>>8)&1):
+                                  struct.pack_into('<I', d, imp+i*step, w | (1<<8)); nweak+=1
+              if nmin or nweak:
+                  open(path,"wb").write(d)
+              return (nmin,nweak)
+
+          src="in/"+[f for f in os.listdir("in") if f.endswith(".ipa")][0]
+          work="work"; shutil.rmtree(work,ignore_errors=True)
+          zipfile.ZipFile(src).extractall(work)
+          for root,_,files in os.walk(work):
+              for fn in files:
+                  fp=os.path.join(root,fn)
+                  if fn=="CherryStudio" or fn.endswith(".dylib") or root.endswith(".appex"):
+                      try:
+                          r=patch_macho(fp)
+                          if r!=(0,0): print("macho:", fp, "minOS-changes",r[0],"weak-syms",r[1])
+                      except Exception as e: print("skip", fp, e)
+          for root,_,files in os.walk(work):
+              for fn in files:
+                  if fn=="Info.plist":
+                      fp=os.path.join(root,fn)
+                      try:
+                          raw=open(fp,"rb").read()
+                          fmt=plistlib.FMT_BINARY if raw[:6]==b"bplist" else plistlib.FMT_XML
+                          dd=plistlib.loads(raw); ch=False
+                          for k in ("MinimumOSVersion","LSMinimumSystemVersion"):
+                              if k in dd:
+                                  try:
+                                      if enc(str(dd[k]))>target: dd[k]=minv; ch=True
+                                  except Exception: pass
+                          if ch: open(fp,"wb").write(plistlib.dumps(dd,fmt=fmt)); print("plist:",fp,"->",minv)
+                      except Exception: pass
+          shutil.make_archive("pkg","zip",work); os.replace("pkg.zip","CherryStudio-unsigned-ios16.ipa")
+          print("built", os.path.getsize("CherryStudio-unsigned-ios16.ipa"))
+          PY
+          sha256sum CherryStudio-unsigned-ios16.ipa | tee SHA256SUMS-ios16.txt
+      - name: Create release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          set -euxo pipefail
+          tag="trollstore-ipa-ios16-chained-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$tag" -R ZJDCM/cherry-ipa \
+            --title "Cherry Studio IPA (iOS16 + weak chained imports) $tag" \
+            --notes "minOS 16.0; chained-fixup imports marked weak." \
+            CherryStudio-unsigned-ios16.ipa SHA256SUMS-ios16.txt
+          echo "TAG=$tag"
